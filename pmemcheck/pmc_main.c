@@ -67,6 +67,9 @@ static struct pmem_ops {
     /** Set of registered persistent memory regions. */
     OSet *pmem_mappings;
 
+    /** Inversion of pmem_mappings. */
+    OSet *nonpmem_mappings;
+
     /** Holds possible multiple overwrite error events. */
     struct pmem_st **multiple_stores;
 
@@ -154,6 +157,12 @@ typedef struct {
 /** Number of sblock run. */
 static ULong sblocks = 0;
 
+/** Cached last pmem region. */
+static struct pmem_st *lastPMEM = NULL;
+
+/** Cached last non-pmem region. */
+static struct pmem_st *lastNONPMEM = NULL;
+
 /**
 * \brief Check if a given store overlaps with registered persistent memory
 *        regions.
@@ -161,13 +170,30 @@ static ULong sblocks = 0;
 * \param[in] size The size of the store.
 * \return True if store overlaps with any registered region, false otherwise.
 */
-static Bool
+static inline __attribute__((always_inline)) Bool
 is_pmem_access(Addr addr, SizeT size)
 {
     struct pmem_st tmp = {0};
     tmp.size = size;
     tmp.addr = addr;
-    return VG_(OSetGen_Contains)(pmem.pmem_mappings, &tmp);
+
+    if (LIKELY(lastNONPMEM && cmp_pmem_st(lastNONPMEM, &tmp) == 0))
+        return False;
+
+    if (LIKELY(lastPMEM && cmp_pmem_st(lastPMEM, &tmp) == 0))
+        return True;
+
+    struct pmem_st *nonpmem_st =
+                    VG_(OSetGen_Lookup)(pmem.nonpmem_mappings, &tmp);
+    if (nonpmem_st) {
+        lastNONPMEM = nonpmem_st;
+    } else {
+        struct pmem_st *pmem_st = VG_(OSetGen_Lookup)(pmem.pmem_mappings, &tmp);
+        tl_assert(pmem_st != NULL);
+        lastPMEM = pmem_st;
+    }
+
+    return nonpmem_st == NULL;
 }
 
 /**
@@ -1171,19 +1197,62 @@ do_flush(UWord base, UWord size)
     if (pmem.log_stores)
         VG_(emit)("|FLUSH;0x%lx;0x%llx", flush_info.addr, flush_info.size);
 
-    /* unfortunately lookup doesn't work here, the oset is an avl tree */
-
     Bool valid_flush = False;
-    /* reset the iterator */
-    VG_(OSetGen_ResetIter)(pmem.pmem_stores);
+
+    /* try to find any region that overlaps with what we want to flush */
+    struct pmem_st *f = VG_(OSetGen_Lookup)(pmem.pmem_stores, &flush_info);
+    /*
+     * If there's none, then there's no point in searching for the first one
+     * and iterating - just skip to the end where we report unneeded flushes.
+     */
+    if (!f)
+        goto end;
+
+    /*
+     * Find out if we have a perfect match and region is expected state (we'll
+     * report it in the slow path otherwise).
+     */
+    if (f->addr == flush_info.addr && f->size == flush_info.size &&
+            f->state == STST_DIRTY) {
+        f->state = STST_FLUSHED;
+        return;
+    }
+
+    /* Let's find out the first overlapping region. */
+    struct pmem_st *first_overlapping;
+    struct pmem_st first_overlapping_tmpl = {0};
+    first_overlapping_tmpl.addr = flush_info.addr;
+    first_overlapping_tmpl.size = 1;
+
+    do {
+        first_overlapping = VG_(OSetGen_Lookup)(pmem.pmem_stores,
+                                                &first_overlapping_tmpl);
+        first_overlapping_tmpl.addr++;
+    } while (first_overlapping == NULL);
+
     Addr flush_max = flush_info.addr + flush_info.size;
     struct pmem_st *being_flushed;
+
+    /* reset the iterator */
+    VG_(OSetGen_ResetIterAt)(pmem.pmem_stores, first_overlapping);
+
+    int found = 0;
     while ((being_flushed = VG_(OSetGen_Next)(pmem.pmem_stores)) != NULL){
 
        /* not an interesting entry, flush doesn't matter */
        if (cmp_pmem_st(&flush_info, being_flushed) != 0) {
-           continue;
+           if (found)
+               /*
+                * If previously we found at least one overlapping region and
+                * the current one doesn't overlap, then there's no point in
+                * looking further.
+                */
+               break;
+
+           /* impossible, first region cannot not overlap */
+           tl_assert(0);
        }
+       found++;
 
        valid_flush = True;
        /* check for multiple flushes of stores */
@@ -1242,6 +1311,7 @@ do_flush(UWord base, UWord size)
        }
     }
 
+end:
     if (!valid_flush && pmem.check_flush) {
         /* unnecessary flush event - probably an issue */
         struct pmem_st *wrong_flush = VG_(malloc)("pmc.main.cpci.6",
@@ -1748,7 +1818,10 @@ pmc_handle_client_request(ThreadId tid, UWord *arg, UWord *ret )
             temp_info.addr = arg[1];
             temp_info.size = arg[2];
 
+            lastPMEM = NULL;
+            lastNONPMEM = NULL;
             add_region(&temp_info, pmem.pmem_mappings);
+            remove_region(&temp_info, pmem.nonpmem_mappings);
             break;
         }
 
@@ -1757,7 +1830,10 @@ pmc_handle_client_request(ThreadId tid, UWord *arg, UWord *ret )
             temp_info.addr = arg[1];
             temp_info.size = arg[2];
 
+            lastPMEM = NULL;
+            lastNONPMEM = NULL;
             remove_region(&temp_info, pmem.pmem_mappings);
+            add_region(&temp_info, pmem.nonpmem_mappings);
             break;
         }
 
@@ -1962,6 +2038,15 @@ pmc_post_clo_init(void)
 
     pmem.pmem_mappings = VG_(OSetGen_Create)(/*keyOff*/0, cmp_pmem_st,
             VG_(malloc), "pmc.main.cpci.4", VG_(free));
+
+    pmem.nonpmem_mappings = VG_(OSetGen_Create)(/*keyOff*/0, cmp_pmem_st,
+            VG_(malloc), "pmc.main.cpci.5", VG_(free));
+
+    struct pmem_st temp_info = {0};
+    temp_info.addr = 0;
+    temp_info.size = ULONG_MAX;
+
+    add_region(&temp_info, pmem.nonpmem_mappings);
 
     pmem.superfluous_flushes = VG_(malloc)("pmc.main.cpci.6",
             MAX_FLUSH_ERROR_EVENTS * sizeof (struct pmem_st *));
